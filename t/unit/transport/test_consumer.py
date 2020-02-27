@@ -65,6 +65,15 @@ class test_Fetcher:
         await fetcher.on_stop()
 
     @pytest.mark.asyncio
+    async def test_on_stop_drainer__drainer_done2(self, *, fetcher):
+        fetcher._drainer = Mock(done=Mock(return_value=False))
+        with patch('asyncio.wait_for', AsyncMock()) as wait_for:
+            wait_for.coro.return_value = None
+            await fetcher.on_stop()
+        fetcher._drainer.cancel.assert_called_once_with()
+        assert wait_for.call_count
+
+    @pytest.mark.asyncio
     async def test_on_stop__drainer_pending(self, *, fetcher):
         fetcher._drainer = Mock(done=Mock(return_value=False))
         with patch('asyncio.wait_for', AsyncMock()) as wait_for:
@@ -226,6 +235,10 @@ class test_TransactionManager:
         producer.send.assert_called_once_with(
             't', 'k', 'v', None, None, None, transactional_id=None,
         )
+
+    def test_send_soon(self, *, manager):
+        with pytest.raises(NotImplementedError):
+            manager.send_soon(Mock(name='FutureMessage'))
 
     @pytest.mark.asyncio
     async def test_send_and_wait(self, *, manager):
@@ -582,13 +595,11 @@ class test_Consumer:
 
     @pytest.mark.asyncio
     async def test_seek(self, *, consumer):
-        consumer._last_batch[TP1] = 123.3
         consumer._read_offset[TP1] = 301
         consumer._seek = AsyncMock()
 
         await consumer.seek(TP1, 401)
 
-        assert consumer._last_batch.get(TP1) is None
         assert consumer._read_offset[TP1] == 401
         consumer._seek.assert_called_once_with(TP1, 401)
 
@@ -724,9 +735,7 @@ class test_Consumer:
     @pytest.mark.asyncio
     async def test_on_stop(self, *, consumer):
         consumer.app.conf.stream_wait_empty = False
-        consumer._last_batch[TP1] = 30.3
         await consumer.on_stop()
-        assert consumer._last_batch == {}
 
         with pytest.warns(AlreadyConfiguredWarning):
             consumer.app.conf.stream_wait_empty = True
@@ -1258,3 +1267,45 @@ class test_ThreadDelegateConsumer:
             'topic', 'key', partition=3,
         )
         assert ret is consumer._thread.key_partition()
+
+    def test_verify_event_path(self, *, consumer):
+        assert consumer.verify_event_path(30.1, TP1) is None
+
+    @pytest.mark.asyncio
+    async def test_verify_all_partitions_active(self, *, consumer):
+        consumer.assignment = Mock(name='assignment')
+        # use list for order, argument is originally a set.
+        consumer.assignment.return_value = [TP1, TP2, TP3]
+
+        consumer.verify_event_path = Mock(name='verify_event_path')
+
+        with patch('faust.transport.consumer.monotonic') as monotonic:
+            now = monotonic.return_value = 391243.231
+            await consumer.verify_all_partitions_active()
+
+            consumer.verify_event_path.assert_has_calls([
+                call(now, TP1),
+                call(now, TP2),
+                call(now, TP3),
+            ])
+
+    @pytest.mark.asyncio
+    async def test_verify_all_partitions_active__bail_on_sleep(
+            self, *, consumer):
+        consumer.assignment = Mock(name='assignment')
+        consumer.assignment.return_value = [TP1, TP2, TP3]  # must be ordered
+
+        consumer.verify_event_path = Mock(name='verify_event_path')
+        consumer.sleep = AsyncMock()
+
+        async def on_sleep(secs):
+            if consumer.sleep.call_count == 2:
+                consumer._stopped.set()
+
+        consumer.sleep.side_effect = on_sleep
+
+        with patch('faust.transport.consumer.monotonic') as monotonic:
+            now = monotonic.return_value = 391243.231
+            await consumer.verify_all_partitions_active()
+
+            consumer.verify_event_path.assert_called_once_with(now, TP1)

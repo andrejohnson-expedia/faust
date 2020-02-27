@@ -18,11 +18,12 @@ from typing import Any, Dict, IO, Iterable, Mapping, Optional, Set, Union
 import mode
 from aiokafka.structs import TopicPartition
 from mode import ServiceT, get_logger
-from mode.utils.logging import Severity, formatter
+from mode.utils.logging import Severity, formatter2
 
 from .types import AppT, SensorT, TP, TopicT
-from .types._env import BLOCKING_TIMEOUT, CONSOLE_PORT, DEBUG
+from .types._env import CONSOLE_PORT, DEBUG
 from .utils import terminal
+from .utils.functional import consecutive_numbers
 
 try:  # pragma: no cover
     # if installed we use this to set ps.name (argv[0])
@@ -40,8 +41,9 @@ TP_TYPES = (TP, TopicPartition)
 logger = get_logger(__name__)
 
 
-@formatter
-def format_log_arguments(arg: Any) -> Any:  # pragma: no cover
+@formatter2
+def format_log_arguments(
+        arg: Any, record: logging.LogRecord) -> Any:  # pragma: no cover
     # This adds custom formatting to certain log messages.
 
     if arg and isinstance(arg, Mapping):
@@ -64,17 +66,77 @@ def format_log_arguments(arg: Any) -> Any:  # pragma: no cover
                 headers=['topic', 'partition', 'offset'],
             )
     elif arg and isinstance(arg, (set, list)):
-        # Sets/Lists of TopicPartition are converted to terminal table.
-        if isinstance(next(iter(arg)), TP_TYPES):
-            topics: Dict[str, Set[int]] = defaultdict(set)
-            for tp in arg:
-                topics[tp.topic].add(tp.partition)
-
+        if 'Subscribed to topic' in record.msg:
             return '\n' + terminal.logtable(
-                [(k, repr(v)) for k, v in sorted(topics.items())],
-                title='Topic Partition Set',
-                headers=['topic', 'partitions'],
+                [
+                    [str(v)] for v in sorted(arg)
+                ],
+                title='Final Subscription',
+                headers=['topic name'],
             )
+        elif isinstance(next(iter(arg)), TP_TYPES):
+            # Sets/Lists of TopicPartition are converted to terminal table.
+            return _partition_set_logtable(arg)
+
+    elif arg and isinstance(arg, frozenset):
+        if 'subscribed topics to' in record.msg:
+            # aiokafka emits a frozenset of topics,
+            # and we convert this to a terminal table.
+            return '\n' + terminal.logtable(
+                [
+                    [str(v)] for v in sorted(arg)
+                ],
+                title='Requested Subscription',
+                headers=['topic name'],
+            )
+        elif isinstance(next(iter(arg)), TP_TYPES):
+            # Sets/Lists of TopicPartition are converted to terminal table.
+            return _partition_set_logtable(arg)
+
+
+def _partition_set_logtable(arg: Iterable[TP]) -> str:
+    topics: Dict[str, Set[int]] = defaultdict(set)
+    for tp in arg:
+        topics[tp.topic].add(tp.partition)
+
+    return '\n' + terminal.logtable(
+        [(k, _repr_partition_set(v))
+            for k, v in sorted(topics.items())],
+        title='Topic Partition Set',
+        headers=['topic', 'partitions'],
+    )
+
+
+def _repr_partition_set(s: Set[int]) -> str:
+    """Convert set of partition numbers to human readable form.
+
+    This will consolidate ranges of partitions to make them easier
+    to read.
+
+    Example:
+        >>> partitions = {1, 2, 3, 7, 8, 9, 10, 34, 35, 36, 37, 38, 50}
+        >>> _repr_partition_set(partitions)
+        '{1-3, 7-10, 34-38, 50}'
+    """
+    elements = ', '.join(_iter_consecutive_numbers(sorted(s)))
+    return f'{{{elements}}}'
+
+
+def _iter_consecutive_numbers(s: Iterable[int]) -> Iterable[str]:
+    """Find consecutive number ranges from an iterable of integers.
+
+    The number ranges are represented as strings (e.g. ``"3-14"``)
+
+    Example:
+        >>> numbers = {1, 2, 3, 7, 8, 9, 10, 34, 35, 36, 37, 38, 50}
+        >>> list(_iter_consecutive_numbers(numbers))
+        [1-3, 7-10, 34-38, 50]
+    """
+    for numbers in consecutive_numbers(s):
+        if len(numbers) > 1:
+            yield f'{numbers[0]}-{numbers[-1]}'
+        else:
+            yield f'{numbers[0]}'
 
 
 class Worker(mode.Worker):
@@ -160,7 +222,7 @@ class Worker(mode.Worker):
                  logfile: Union[str, IO] = None,
                  stdout: IO = sys.stdout,
                  stderr: IO = sys.stderr,
-                 blocking_timeout: float = BLOCKING_TIMEOUT,
+                 blocking_timeout: float = None,
                  workdir: Union[Path, str] = None,
                  console_port: int = CONSOLE_PORT,
                  loop: asyncio.AbstractEventLoop = None,
@@ -177,8 +239,8 @@ class Worker(mode.Worker):
         if redirect_stdouts_level is None:
             redirect_stdouts_level = (
                 conf.worker_redirect_stdouts_level or logging.INFO)
-        if logging_config is None:
-            logging_config = app.conf.logging_config
+        if logging_config is None and app.conf.logging_config:
+            logging_config = dict(app.conf.logging_config)
         super().__init__(
             *services,
             debug=debug,
@@ -188,7 +250,7 @@ class Worker(mode.Worker):
             loghandlers=app.conf.loghandlers,
             stdout=stdout,
             stderr=stderr,
-            blocking_timeout=blocking_timeout,
+            blocking_timeout=blocking_timeout or 0.0,
             console_port=console_port,
             redirect_stdouts=redirect_stdouts,
             redirect_stdouts_level=redirect_stdouts_level,
@@ -216,6 +278,13 @@ class Worker(mode.Worker):
         self._shutdown_immediately = True
         if self.spinner:
             self.spinner.stop()
+
+    async def maybe_start_blockdetection(self) -> None:
+        """Start blocking detector service if enabled."""
+        # the base class implemention of this
+        # only starts the block detector if self.debug is set.
+        if self.blocking_timeout:
+            await self.blocking_detector.maybe_start()
 
     async def on_startup_finished(self) -> None:
         """Signal called when worker has started."""
